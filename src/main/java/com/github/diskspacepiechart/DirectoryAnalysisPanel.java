@@ -10,6 +10,8 @@ import org.jfree.data.general.DefaultPieDataset;
 
 import javax.swing.*;
 import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.FileVisitResult;
@@ -18,13 +20,23 @@ import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.IntStream;
 
 public class DirectoryAnalysisPanel extends SimpleGridBagJPanel {
 
     private static final String PLEASE_WAIT_TEXT = "Please wait, while directories are analysed...";
 
+    private static final String CARDS_UP_BUTTON = "UP_BUTTON";
+    private static final String CARDS_PROGRESS_BAR = "PROGRESS_BAR";
+
     private final DefaultPieDataset<String> dataset = new DefaultPieDataset<>();
+
+    private final JPanel topPanel;
+    private final CardLayout topCardLayout;
+
+    private File previouslySelectedDirectory;
 
     private File selectedDirectory;
 
@@ -43,13 +55,47 @@ public class DirectoryAnalysisPanel extends SimpleGridBagJPanel {
             this.directoryName = directoryName;
             this.size = size;
         }
+
+        @Override
+        public String toString() {
+            return "AnalysisResult{" +
+                    "directoryName='" + directoryName + '\'' +
+                    ", size=" + size +
+                    '}';
+        }
     }
 
     DirectoryAnalysisPanel() {
 
         jProgressBar = new JProgressBar();
         jProgressBar.setIndeterminate(true);
-        add(jProgressBar, 0, 0, 1, 1, GridBagConstraints.BOTH);
+
+        Button parentDirectoryButton = new Button();
+        parentDirectoryButton.setLabel("Go to Parent Directory");
+
+        parentDirectoryButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                if (selectedDirectory != null) {
+                    File parentFile = selectedDirectory.getParentFile();
+                    if (parentFile != null) {
+                        setSelectedDirectory(parentFile);
+                    }
+                }
+            }
+        });
+
+        topPanel = new JPanel();
+
+        topCardLayout = new CardLayout();
+        topPanel.setLayout(topCardLayout);
+
+        topPanel.add(parentDirectoryButton, CARDS_UP_BUTTON);
+        topPanel.add(jProgressBar, CARDS_PROGRESS_BAR);
+
+        topCardLayout.show(topPanel, CARDS_PROGRESS_BAR);
+
+        add(topPanel, 0, 0, 1, 1, GridBagConstraints.BOTH);
 
         chart = ChartFactory.createPieChart(
                 "Directory sizes",   // chart title
@@ -70,9 +116,9 @@ public class DirectoryAnalysisPanel extends SimpleGridBagJPanel {
                 ChartEntity entity = event.getEntity();
                 String drillDownFileName = null;
                 if (entity instanceof PieSectionEntity) {
-                    drillDownFileName = (String)((PieSectionEntity) entity).getSectionKey();
+                    drillDownFileName = (String) ((PieSectionEntity) entity).getSectionKey();
                 } else if (entity instanceof LegendItemEntity) {
-                    drillDownFileName = (String)((LegendItemEntity) entity).getSeriesKey();
+                    drillDownFileName = (String) ((LegendItemEntity) entity).getSeriesKey();
                 }
 
                 if (drillDownFileName != null) {
@@ -105,31 +151,35 @@ public class DirectoryAnalysisPanel extends SimpleGridBagJPanel {
 
         this.dataset.clear();
 
+        this.previouslySelectedDirectory = this.selectedDirectory;
         this.selectedDirectory = selectedDirectory;
 
-        startBackgroundWork();
+        changeUiBeforeBackgroundWorkStart();
 
         backgroundWorker = new AnalyseDirectoriesInBackgroundWorker(selectedDirectory);
         backgroundWorker.execute();
     }
 
-    private void startBackgroundWork() {
+    private void changeUiBeforeBackgroundWorkStart() {
         this.jProgressBar.setString(PLEASE_WAIT_TEXT);
         this.jProgressBar.setStringPainted(true);
         this.jProgressBar.setIndeterminate(true);
+
+        topCardLayout.show(topPanel, CARDS_PROGRESS_BAR);
     }
 
-    private void stopBackgroundWork() {
+    private void changeUiAfterBackgroundWorkStop() {
         this.chart.setTitle(selectedDirectory.getAbsolutePath());
         this.jProgressBar.setIndeterminate(false);
         this.jProgressBar.setMaximum(100);
         this.jProgressBar.setValue(100);
         this.jProgressBar.setString("");
+
+        topCardLayout.show(topPanel, CARDS_UP_BUTTON);
     }
 
     private void onDirectoryAnalysed(AnalysisResult ar) {
         this.dataset.setValue(ar.directoryName, ar.size);
-
     }
 
 
@@ -142,7 +192,9 @@ public class DirectoryAnalysisPanel extends SimpleGridBagJPanel {
         }
 
         @Override
-        protected Void doInBackground() throws Exception {
+        protected Void doInBackground() throws IOException {
+
+            IOException exceptionToPropagate = null;
 
             File[] files = directoryToAnalyse.listFiles(File::isDirectory);
             if (files != null) {
@@ -151,12 +203,28 @@ public class DirectoryAnalysisPanel extends SimpleGridBagJPanel {
                 }
 
                 if (files != null) {
+
                     for (File theDir : files) {
                         if (Thread.currentThread().isInterrupted()) {
                             break;
                         }
 
-                        long directorySize = getDirectorySize(theDir);
+                        long directorySize;
+
+                        try {
+
+                            directorySize = getDirectorySize(theDir);
+
+                        } catch (IOException ex) {
+                            if (exceptionToPropagate != null) {
+                                exceptionToPropagate.addSuppressed(ex);
+                            } else {
+                                exceptionToPropagate = ex;
+                            }
+
+                            directorySize = 0;
+
+                        }
 
                         AnalysisResult result = new AnalysisResult(theDir.getName(), directorySize);
 
@@ -169,37 +237,38 @@ public class DirectoryAnalysisPanel extends SimpleGridBagJPanel {
                 }
             }
 
+            if (exceptionToPropagate != null) {
+                throw exceptionToPropagate;
+            }
+
             return null;
         }
 
-        private long getDirectorySize(File file) {
-            try {
-                AtomicLong size = new AtomicLong(0);
+        private long getDirectorySize(File file) throws IOException {
 
-                Files.walkFileTree(file.toPath(), new SimpleFileVisitor<Path>() {
-                    @Override
-                    public FileVisitResult visitFile(Path file, BasicFileAttributes fileAttributes) {
-                        // sum size of all visit file
-                        size.addAndGet(fileAttributes.size());
+            AtomicLong size = new AtomicLong(0);
 
-                        FileVisitResult fileVisitResult;
+            Files.walkFileTree(file.toPath(), new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes fileAttributes) {
+                    // sum size of all visit file
+                    size.addAndGet(fileAttributes.size());
 
-                        if (!Thread.currentThread().isInterrupted()) {
-                            fileVisitResult = FileVisitResult.CONTINUE;
-                        } else {
-                            size.set(-1);
-                            fileVisitResult = FileVisitResult.TERMINATE;
-                        }
-                        return fileVisitResult;
+                    FileVisitResult fileVisitResult;
+
+                    if (!Thread.currentThread().isInterrupted()) {
+                        fileVisitResult = FileVisitResult.CONTINUE;
+                    } else {
+                        size.set(-1);
+                        fileVisitResult = FileVisitResult.TERMINATE;
                     }
-                });
+                    return fileVisitResult;
+                }
+            });
 
-                return size.get();
+            return size.get();
 
 
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
         }
 
         @Override
@@ -209,8 +278,41 @@ public class DirectoryAnalysisPanel extends SimpleGridBagJPanel {
 
         @Override
         protected void done() {
-            if(!isCancelled()) {
-                stopBackgroundWork();
+
+            if (!isCancelled()) {
+                changeUiAfterBackgroundWorkStop();
+            }
+
+            DefaultPieDataset<String> theDataset = DirectoryAnalysisPanel.this.dataset;
+            boolean allValuesAreZero = IntStream.range(0, theDataset.getItemCount())
+                    .mapToObj(theDataset::getValue)
+                    .mapToInt(Number::intValue)
+                    .allMatch(value -> value == 0);
+
+            if (theDataset.getItemCount() == 0 || allValuesAreZero) {
+                try {
+                    get();
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+
+                    String message = String.format("No directory could be evaluated as "
+                                    + "similar errors were encountered: \n%s\n\n"
+                                    + "OK: stop here, CANCEL: go back to previous directory", cause);
+
+                    int selection = JOptionPane.showConfirmDialog(
+                            DirectoryAnalysisPanel.this,
+                            message,
+                            "Error(s) collecting disk usage data",
+                            JOptionPane.OK_CANCEL_OPTION);
+
+                    final int cancelSelection = 2;
+                    if (selection == cancelSelection) {
+                        setSelectedDirectory(DirectoryAnalysisPanel.this.previouslySelectedDirectory);
+                    }
+
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
